@@ -1,48 +1,48 @@
 #!/bin/bash
 
-# Usage: ./convert_config_to_json.sh config.yaml dev
-
-if [ "$#" -ne 2 ]; then
-    echo "Usage: $0 <config.yaml> <environment>"
-    exit 1
-fi
-
-CONFIG_FILE=$1
-ENVIRONMENT=$2
-
-# Check if yq and jq are installed
+# Check for required tools
 if ! command -v yq &> /dev/null || ! command -v jq &> /dev/null; then
-    echo "Please install yq and jq to run this script."
+    echo "Please install 'yq' and 'jq' to run this script."
     exit 1
 fi
 
-# Initialize the deployment JSON structure
-DEPLOYMENT_JSON='{}'
+# Input arguments
+ENV=$1
+if [ -z "$ENV" ]; then
+    echo "Usage: $0 <environment>"
+    exit 1
+fi
 
-# Extract `helm_chart_version` from the YAML file
-HELM_CHART_VERSION=$(yq '.helm_chart_version' "$CONFIG_FILE")
+# Input and output files
+YAML_FILE="config.yaml"
+OUTPUT_JSON="deployment.json"
 
-# Loop through each cluster in the config.yaml
-yq '.deploy' "$CONFIG_FILE" -o json | jq -c 'to_entries[]' | while read -r CLUSTER_ENTRY; do
-    CLUSTER_NAME=$(echo "$CLUSTER_ENTRY" | jq -r '.key')
-    NAMESPACES=$(echo "$CLUSTER_ENTRY" | jq -r '.value | to_entries[]')
+# Read helm_chart_version
+HELM_VERSION=$(yq '.helm_chart_version' $YAML_FILE)
 
-    INCLUDE_ARRAY="[]"
+# Initialize the JSON object
+JSON_OUTPUT="{}"
 
-    # Loop through each namespace and activity in the cluster
-    echo "$NAMESPACES" | while read -r NAMESPACE_ENTRY; do
-        NAMESPACE=$(echo "$NAMESPACE_ENTRY" | jq -r '.key')
-        ACTIVITIES=$(echo "$NAMESPACE_ENTRY" | jq -r '.value[]')
+# Parse clusters and namespaces
+CLUSTERS=$(yq '.deploy | keys' $YAML_FILE -o=json | jq -r '.[]')
+
+for CLUSTER in $CLUSTERS; do
+    # Initialize includes array
+    INCLUDES=()
+
+    # Parse namespaces and activities
+    NAMESPACES=$(yq ".deploy.$CLUSTER | keys" $YAML_FILE -o=json | jq -r '.[]')
+    for NAMESPACE in $NAMESPACES; do
+        # Parse the activities array
+        ACTIVITIES=$(yq ".deploy.$CLUSTER.$NAMESPACE" $YAML_FILE -o=json | jq -r '.[]')
 
         for ACTIVITY in $ACTIVITIES; do
-            ACTIVITY_NAME=$(basename "$ACTIVITY")
-
-            # Create a JSON object for the activity
-            INCLUDE_OBJECT=$(jq -n \
+            # Build include JSON object
+            INCLUDE=$(jq -n \
                 --arg helm_chart_name "camera-app-helm-charts" \
-                --arg helm_chart_version "$HELM_CHART_VERSION" \
-                --arg helm_chart_dir "hlm-public-local/com/db/cashmgmt/$HELM_CHART_VERSION" \
-                --arg helm_values_file_name "values.yaml -f $ACTIVITY/values.yaml -f $ACTIVITY/$ENVIRONMENT/values-$NAMESPACE.yaml" \
+                --arg helm_chart_version "$HELM_VERSION" \
+                --arg helm_chart_dir "hlm-public-local/com/db/cashmgmt/$HELM_VERSION" \
+                --arg helm_values_file_name "values.yaml -f $ACTIVITY/values.yaml -f $ACTIVITY/$ENV/values-$NAMESPACE.yaml" \
                 --arg gke_namespace "$NAMESPACE" \
                 '{
                     helm_chart_name: $helm_chart_name,
@@ -51,20 +51,16 @@ yq '.deploy' "$CONFIG_FILE" -o json | jq -c 'to_entries[]' | while read -r CLUST
                     helm_values_file_name: $helm_values_file_name,
                     gke_namespace: $gke_namespace
                 }')
-
-            # Add the object to the include array
-            INCLUDE_ARRAY=$(echo "$INCLUDE_ARRAY" | jq ". + [$INCLUDE_OBJECT]")
+            INCLUDES+=("$INCLUDE")
         done
     done
 
-    # Add the cluster entry to the deployment JSON
-    DEPLOYMENT_JSON=$(echo "$DEPLOYMENT_JSON" | jq \
-        --arg cluster "$CLUSTER_NAME" \
-        --argjson include "$INCLUDE_ARRAY" \
-        '. + {($cluster): {include: $include}}')
+    # Add cluster data to JSON output
+    CLUSTER_JSON=$(jq -n --argjson includes "$(printf '%s\n' "${INCLUDES[@]}" | jq -s '.')" '{include: $includes}')
+    JSON_OUTPUT=$(jq --arg cluster "$CLUSTER" --argjson clusterJson "$CLUSTER_JSON" '.[$cluster] = $clusterJson' <<< "$JSON_OUTPUT")
 done
 
-# Save the JSON to deployment.json
-echo "$DEPLOYMENT_JSON" | jq '.' > deployment.json
+# Write to output JSON
+echo "$JSON_OUTPUT" | jq . > "$OUTPUT_JSON"
 
-echo "Generated deployment.json successfully."
+echo "JSON conversion complete. Output written to $OUTPUT_JSON"
