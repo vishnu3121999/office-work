@@ -3,15 +3,17 @@
 # Input files
 CLUSTER_REGION_FILE="clusterRegion.json"
 CONFIG_FILE="config.yaml"
-OUTPUT_FILE="install.json"
 
-# Get environment as input
-if [ -z "$1" ]; then
-    echo "Usage: $0 <environment>"
+# Get input parameters
+if [ $# -ne 2 ]; then
+    echo "Usage: $0 <environment> <operation_type>"
+    echo "Example: $0 dev install"
     exit 1
 fi
-ENVIRONMENT=$1
 
+ENVIRONMENT=$1
+OPERATION_TYPE=$2
+OUTPUT_FILE="mongo-${OPERATION_TYPE}.json"
 # Static list for workloads that use "values.yaml" only
 STATIC_VALUES_LIST=("w2" "w3")
 
@@ -48,7 +50,7 @@ is_in_multi_values_list() {
 jq -r '.[] | .cluster.name + " " + .cluster.region' "$CLUSTER_REGION_FILE" > "$TMP_CLUSTER"
 
 # Extract helm install configurations from config.yaml
-yq eval '.mongo.install[] | .name + " " + .version' "$CONFIG_FILE" > "$TMP_INSTALL"
+yq eval '.mongo.${OPERATION_TYPE}[] | .name + " " + .version' "$CONFIG_FILE" > "$TMP_INSTALL"
 
 # Start building the JSON
 {
