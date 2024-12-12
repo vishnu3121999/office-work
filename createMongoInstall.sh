@@ -5,17 +5,38 @@ CLUSTER_REGION_FILE="clusterRegion.json"
 CONFIG_FILE="config.yaml"
 OUTPUT_FILE="install.json"
 
-# Static list for workloads that should use "values.yaml" without appending cluster name
+# Get environment as input
+if [ -z "$1" ]; then
+    echo "Usage: $0 <environment>"
+    exit 1
+fi
+ENVIRONMENT=$1
+
+# Static list for workloads that use "values.yaml" only
 STATIC_VALUES_LIST=("w2" "w3")
+
+# Static list for workloads requiring "values.yaml -f ./<name>/values-<env>.yaml"
+STATIC_MULTI_VALUES_LIST=("w4")
 
 # Temporary files for parsing
 TMP_CLUSTER="/tmp/clusters.tmp"
 TMP_INSTALL="/tmp/install.tmp"
 
-# Function to check if a workload is in the static list
+# Function to check if a workload is in the static list for "values.yaml"
 is_in_static_list() {
     local workload=$1
     for item in "${STATIC_VALUES_LIST[@]}"; do
+        if [[ "$item" == "$workload" ]]; then
+            return 0 # True
+        fi
+    done
+    return 1 # False
+}
+
+# Function to check if a workload requires multiple values files
+is_in_multi_values_list() {
+    local workload=$1
+    for item in "${STATIC_MULTI_VALUES_LIST[@]}"; do
         if [[ "$item" == "$workload" ]]; then
             return 0 # True
         fi
@@ -42,6 +63,8 @@ yq eval '.mongo.install[] | .name + " " + .version' "$CONFIG_FILE" > "$TMP_INSTA
             # Decide on helm_values_file_name
             if is_in_static_list "$helm_name"; then
                 values_file="values.yaml"
+            elif is_in_multi_values_list "$helm_name"; then
+                values_file="values.yaml -f ./${helm_name}/values-${ENVIRONMENT}.yaml"
             else
                 values_file="values-${cluster}.yaml"
             fi
@@ -78,4 +101,4 @@ EOF
 rm -f "$TMP_CLUSTER" "$TMP_INSTALL"
 
 # Output result
-echo "Generated $OUTPUT_FILE successfully."
+echo "Generated $OUTPUT_FILE successfully for environment: $ENVIRONMENT."
