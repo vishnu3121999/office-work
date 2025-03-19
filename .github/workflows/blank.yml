@@ -14,7 +14,7 @@ jobs:
       image: ghcr.io/vishnu3121999/vishnu-java:latest
       credentials:
         username: vishnu3121999
-        password: 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
+        password: ${{ secrets.GH_TOKEN }}
       # If your Dockerfile sets up a non-root user (e.g., 'runner') and proper workspace permissions,
       # you might add options to ensure the correct user is used. For example:
       # options: --user runner
