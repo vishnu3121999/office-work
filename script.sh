@@ -1,66 +1,124 @@
 #!/bin/bash
+set -euo pipefail
+# compare_deps.sh
+# Compares the Bazel Maven dependency graph between two git branches.
+# It stashes local changes, checks out each branch, runs a Bazel query using @mvn,
+# prints the raw temporary dependency files, and outputs a formatted diff.
+# Usage: ./compare_deps.sh <base_branch> <feature_branch>
+# Example: ./compare_deps.sh master feature
 
-# Check for required tools
-if ! command -v yq &> /dev/null || ! command -v jq &> /dev/null; then
-    echo "Please install 'yq' and 'jq' to run this script."
-    exit 1
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 <base_branch> <feature_branch>"
+  exit 1
 fi
 
-# Input arguments
-ENV=$1
-if [ -z "$ENV" ]; then
-    echo "Usage: $0 <environment>"
-    exit 1
+BASE_BRANCH=$1
+FEATURE_BRANCH=$2
+
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+echo "Current branch is '$CURRENT_BRANCH'."
+
+# Stash any local changes (including untracked and ignored files) to avoid checkout conflicts.
+if [ -n "$(git status --porcelain)" ]; then
+  echo "Local changes detected. Stashing changes (including ignored files)..."
+  git stash push -a -m "temp stash for compare_deps.sh"
+  STASHED=1
+else
+  STASHED=0
 fi
 
-# Input and output files
-YAML_FILE="config.yaml"
-OUTPUT_JSON="deployment.json"
+# Create a temporary directory for dependency files.
+TMP_DIR=$(mktemp -d)
+echo "Using temporary directory: $TMP_DIR"
 
-# Read helm_chart_version
-HELM_VERSION=$(yq '.helm_chart_version' $YAML_FILE)
+# Use @mvn instead of @maven in the Bazel query.
+BAZEL_QUERY_CMD="bazel query @mvn//:all --output=build | grep tags | awk -F'\"' '{print \$2}' | sed 's/maven_coordinates=//' | sort"
 
-# Initialize the JSON object
-JSON_OUTPUT="{}"
+# Function to run Bazel query on a given branch and write output to a file.
+run_query() {
+  local branch=$1
+  local outfile=$2
+  echo "Force checking out branch: $branch"
+  git checkout -f "$branch" || { echo "Failed to checkout $branch"; exit 1; }
+  echo "Running Bazel query on branch '$branch'..."
+  eval $BAZEL_QUERY_CMD > "$outfile"
+  echo "Dependencies from '$branch' saved to $outfile."
+}
 
-# Parse clusters and namespaces
-CLUSTERS=$(yq '.deploy | keys' $YAML_FILE -o=json | jq -r '.[]')
+# Run query on base and feature branches.
+run_query "$BASE_BRANCH" "$TMP_DIR/base_deps.txt"
+run_query "$FEATURE_BRANCH" "$TMP_DIR/feature_deps.txt"
 
-for CLUSTER in $CLUSTERS; do
-    # Initialize includes array
-    INCLUDES=()
+# Print the temporary dependency files.
+echo ""
+echo "Base dependencies file:"
+cat "$TMP_DIR/base_deps.txt"
+echo ""
+echo "Feature dependencies file:"
+cat "$TMP_DIR/feature_deps.txt"
+echo ""
 
-    # Parse namespaces and activities
-    NAMESPACES=$(yq ".deploy.$CLUSTER | keys" $YAML_FILE -o=json | jq -r '.[]')
-    for NAMESPACE in $NAMESPACES; do
-        # Parse the activities array
-        ACTIVITIES=$(yq ".deploy.$CLUSTER.$NAMESPACE" $YAML_FILE -o=json | jq -r '.[]')
+# Generate a unified diff with zero context.
+echo "Comparing dependency lists (formatted):"
+diff -U0 "$TMP_DIR/base_deps.txt" "$TMP_DIR/feature_deps.txt" > "$TMP_DIR/diff_output.txt" || true
 
-        for ACTIVITY in $ACTIVITIES; do
-            # Build include JSON object
-            INCLUDE=$(jq -n \
-                --arg helm_chart_name "camera-app-helm-charts" \
-                --arg helm_chart_version "$HELM_VERSION" \
-                --arg helm_chart_dir "hlm-public-local/com/db/cashmgmt/$HELM_VERSION" \
-                --arg helm_values_file_name "values.yaml -f $ACTIVITY/values.yaml -f $ACTIVITY/$ENV/values-$NAMESPACE.yaml" \
-                --arg gke_namespace "$NAMESPACE" \
-                '{
-                    helm_chart_name: $helm_chart_name,
-                    helm_chart_version: $helm_chart_version,
-                    helm_chart_dir: $helm_chart_dir,
-                    helm_values_file_name: $helm_values_file_name,
-                    gke_namespace: $gke_namespace
-                }')
-            INCLUDES+=("$INCLUDE")
-        done
+# Initialize arrays to hold lines for each hunk.
+declare -a old_lines=()
+declare -a new_lines=()
+
+# Function to process a diff hunk and print formatted changes.
+process_hunk() {
+    local count_old=${#old_lines[@]}
+    local count_new=${#new_lines[@]}
+    local max=$(( count_old > count_new ? count_old : count_new ))
+    for (( i=0; i<$max; i++ )); do
+        if [ $i -lt $count_old ] && [ $i -lt $count_new ]; then
+            echo "${old_lines[$i]}   -->   ${new_lines[$i]}"
+        elif [ $i -lt $count_old ]; then
+            echo "${old_lines[$i]}   -->   (removed)"
+        elif [ $i -lt $count_new ]; then
+            echo "(none)   -->   ${new_lines[$i]}"
+        fi
     done
+    # Clear arrays for the next hunk.
+    old_lines=()
+    new_lines=()
+}
 
-    # Add cluster data to JSON output
-    CLUSTER_JSON=$(jq -n --argjson includes "$(printf '%s\n' "${INCLUDES[@]}" | jq -s '.')" '{include: $includes}')
-    JSON_OUTPUT=$(jq --arg cluster "$CLUSTER" --argjson clusterJson "$CLUSTER_JSON" '.[$cluster] = $clusterJson' <<< "$JSON_OUTPUT")
-done
+# Process the diff output.
+while IFS= read -r line; do
+    if [[ "$line" =~ ^@@ ]]; then
+        # Process any hunk already collected.
+        if [ ${#old_lines[@]} -gt 0 ] || [ ${#new_lines[@]} -gt 0 ]; then
+            process_hunk
+        fi
+    elif [[ "$line" =~ ^- && ! "$line" =~ ^--- ]]; then
+        # Remove the "-" prefix.
+        old_lines+=( "${line:1}" )
+    elif [[ "$line" =~ ^\+ && ! "$line" =~ ^\+\+\+ ]]; then
+        # Remove the "+" prefix.
+        new_lines+=( "${line:1}" )
+    fi
+done < "$TMP_DIR/diff_output.txt"
 
-# Write to output JSON
-echo "$JSON_OUTPUT" | jq . > "$OUTPUT_JSON"
+# Process any remaining lines.
+if [ ${#old_lines[@]} -gt 0 ] || [ ${#new_lines[@]} -gt 0 ]; then
+    process_hunk
+fi
 
-echo "JSON conversion complete. Output written to $OUTPUT_JSON"
+echo ""
+echo "Formatted diff output complete."
+
+# Restore original branch.
+echo "Force restoring original branch: $CURRENT_BRANCH"
+git checkout -f "$CURRENT_BRANCH" || { echo "Failed to checkout $CURRENT_BRANCH"; exit 1; }
+
+# Restore stashed changes if any.
+if [ "$STASHED" -eq 1 ]; then
+  echo "Restoring stashed changes..."
+  git stash pop || { echo "Failed to restore stashed changes."; exit 1; }
+fi
+
+# Clean up temporary directory.
+rm -rf "$TMP_DIR"
+echo "Temporary files cleaned up."
