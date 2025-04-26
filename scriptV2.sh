@@ -39,6 +39,7 @@ QUERY='bazel query @mvn//:all --output=build \
   | sort'
 
 run_query(){
+  # ensure branch and out are always set
   local branch="${1:-}"
   local out="${2:-}"
   git checkout -f "$branch" &>/dev/null
