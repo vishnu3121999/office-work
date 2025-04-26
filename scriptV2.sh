@@ -39,10 +39,8 @@ QUERY='bazel query @mvn//:all --output=build \
   | sort'
 
 run_query(){
-  local branch
-  local out
-  branch="$1"
-  out="$2"
+  local branch="${1:-}"
+  local out="${2:-}"
   git checkout -f "$branch" &>/dev/null
   echo "📦 Querying $branch… → $out"
   eval "$QUERY" > "$out"
