@@ -39,8 +39,10 @@ QUERY='bazel query @mvn//:all --output=build \
   | sort'
 
 run_query(){
-  local branch="$1"
-  local out="$2"
+  local branch
+  local out
+  branch="$1"
+  out="$2"
   git checkout -f "$branch" &>/dev/null
   echo "📦 Querying $branch… → $out"
   eval "$QUERY" > "$out"
@@ -212,7 +214,7 @@ if [ "${#REMOVED[@]}" -gt 0 ]; then
 fi
 
 # 13) Final: list all affected services
-echo "── Affected services across all changes ──"
+echo "── Affected services across all changes ────"
 mapfile -t ALL_SERVICES < <(printf "%s\n" "${!AFFECTED_SERVICES[@]}" | sort)
 if [ "${#ALL_SERVICES[@]}" -eq 0 ]; then
   echo "  (none)"
