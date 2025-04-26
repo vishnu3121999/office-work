@@ -14,10 +14,10 @@ FEATURE=$2
 CURR=$(git rev-parse --abbrev-ref HEAD)
 REPO="mvn"   # your maven_install name
 
-echo "📌 Comparing '$BASE' → '$FEATURE'  (starting on '$CURR')"
+echo "📌 Comparing '$BASE' → '$FEATURE'  (on '$CURR')"
 echo
 
-# 1) Stash everything so checkout never fails
+# 1) Stash everything so checkouts never fail
 if [ -n "$(git status --porcelain)" ]; then
   echo "🔒 Stashing local changes..."
   git stash push -a -m "temp-stash-for-compare_deps"
@@ -26,7 +26,7 @@ else
   STASHED=0
 fi
 
-# 2) Create temp dir
+# 2) Make a temp dir
 TMP=$(mktemp -d)
 echo "📂 Temp dir: $TMP"
 echo
@@ -38,18 +38,20 @@ QUERY='bazel query @mvn//:all --output=build \
   | sed "s/maven_coordinates=//" \
   | sort'
 
-run_query(){
-  local branch=$1 out=$2
+# Safely bind branch+out
+run_query() {
+  local branch="$1"
+  local out="$2"
   git checkout -f "$branch" &>/dev/null
-  echo "📦 Querying $branch… → $out"
+  echo "📦 Querying $branch → $out"
   eval "$QUERY" > "$out"
 }
 
-# 4) Capture both branches’ deps
+# 4) Capture both sides
 run_query "$BASE"    "$TMP/base_deps.txt"
 run_query "$FEATURE" "$TMP/feature_deps.txt"
 
-# 5) Print raw lists
+# 5) Show raw lists
 echo "── Base dependencies ──"
 cat "$TMP/base_deps.txt"
 echo
@@ -57,23 +59,22 @@ echo "── Feature dependencies ──"
 cat "$TMP/feature_deps.txt"
 echo
 
-# 6) Load into associative arrays
+# 6) Load into maps
 declare -A base_versions feat_versions
 while IFS= read -r L; do
-  ga=${L%:*}; v=${L##*:}
-  base_versions["$ga"]=$v
+  base_versions["${L%:*}"]="${L##*:}"
 done <"$TMP/base_deps.txt"
 while IFS= read -r L; do
-  ga=${L%:*}; v=${L##*:}
-  feat_versions["$ga"]=$v
+  feat_versions["${L%:*}"]="${L##*:}"
 done <"$TMP/feature_deps.txt"
 
-# 7) Union of all GA keys
+# 7) Union of all G:A coords
 mapfile -t ALL_GA < <(
-  printf "%s\n" "${!base_versions[@]}" "${!feat_versions[@]}" | sort -u
+  printf "%s\n" "${!base_versions[@]}" "${!feat_versions[@]}" |
+    sort -u
 )
 
-# 8) Print version changes and classify
+# 8) Diff summary
 echo "── Version changes ──"
 declare -a ADDED_UPGRADED REMOVED
 for ga in "${ALL_GA[@]}"; do
@@ -92,130 +93,91 @@ for ga in "${ALL_GA[@]}"; do
 done
 echo
 
-# 9) Pre-fetch @mvn for rdeps()
+# 9) Pre-fetch so rdeps works
 echo "⏳ Pre-fetching @mvn artifacts…"
 bazel fetch @mvn//:all &>/dev/null || true
 echo
 
-# 10) Prepare global set of affected services
-declare -A AFFECTED_SERVICES
-record_services(){
-  for svc in "$@"; do
-    if [[ -n "$svc" ]]; then
-      AFFECTED_SERVICES["$svc"]=1
-    fi
-  done
+# 10) Collect affected services
+declare -A AFFECTED
+record() { for s in "$@"; do [[ -n "$s" ]] && AFFECTED["$s"]=1; done; }
+
+# helper to map a single GA on a branch
+map_ga() {
+  local ga=$1 status=$2 branch=$3
+  echo
+  echo "▶ $ga  [$status]"
+  git checkout -f "$branch" &>/dev/null
+
+  local label="@${REPO}//:$(echo "$ga" | sed -E 's/[:\.-]/_/g')"
+  echo "    Bazel label        : $label"
+
+  # Direct
+  echo "    Direct dependency  :"
+  mapfile -t DIR < <(
+    grep -R --include='BUILD*' -l "$label" . |
+      xargs -r -n1 dirname |
+      sort -u
+  )
+  if [ "${#DIR[@]}" -eq 0 ]; then
+    echo "      (none)"
+  else
+    for d in "${DIR[@]}"; do
+      echo "      - $d"; record "$d"
+    done
+  fi
+
+  # Transitive (keep only //… packages)
+  echo "    Transitive dependency:"
+  mapfile -t TR < <(
+    bazel query --noshow_loading_progress --noshow_progress \
+      "rdeps(//..., $label)" \
+      --noimplicit_deps --notool_deps --output=package 2>/dev/null |
+      grep -v '^INFO:' |
+      grep '^//' |
+      sort -u
+  )
+  if [ "${#TR[@]}" -eq 0 ]; then
+    echo "      (none)"
+  else
+    for t in "${TR[@]}"; do
+      echo "      - $t"; record "$t"
+    done
+  fi
 }
 
-# 11) Map added/upgraded on FEATURE branch
+# 11) Map added/upgraded on feature
 if [ "${#ADDED_UPGRADED[@]}" -gt 0 ]; then
-  echo "──── Mapping added/upgraded deps on '$FEATURE' ────"
-  git checkout -f "$FEATURE" &>/dev/null
+  echo "──── Mapping added/upgraded on '$FEATURE' ────"
   for ga in "${ADDED_UPGRADED[@]}"; do
     oldv=${base_versions[$ga]:-}
-    newv=${feat_versions[$ga]:-}
-    echo
-    echo "▶ $ga"
-    echo "    Status             : $( [ -z "$oldv" ] && echo "added → $newv" || echo "upgraded: $oldv → $newv" )"
-    label=$(echo "$ga" | sed -E 's/[:\.-]/_/g')
-    bz="@${REPO}//:$label"
-    echo "    Bazel label        : $bz"
-
-    # Direct dependency
-    echo "    Direct dependency  :"
-    mapfile -t DIR_SRCS < <(
-      grep -R --include='BUILD*' -l "$bz" . \
-      | xargs -r -n1 dirname \
-      | sort -u
-    )
-    if [ "${#DIR_SRCS[@]}" -eq 0 ]; then
-      echo "      (none)"
-    else
-      for svc in "${DIR_SRCS[@]}"; do
-        echo "      - $svc"
-        record_services "$svc"
-      done
-    fi
-
-    # Transitive dependency (filter out INFO:)
-    echo "    Transitive dependency:"
-    mapfile -t TRANS_SRCS < <(
-      bazel query --noshow_loading_progress --noshow_progress \
-        "rdeps(//..., $bz)" \
-        --noimplicit_deps --notool_deps --output=package 2>&1 \
-      | grep -v '^INFO:' \
-      | sort -u
-    )
-    if [ "${#TRANS_SRCS[@]}" -eq 0 ]; then
-      echo "      (none)"
-    else
-      for svc in "${TRANS_SRCS[@]}"; do
-        echo "      - $svc"
-        record_services "$svc"
-      done
-    fi
+    newv=${feat_versions[$ga]}
+    status=$( [ -z "$oldv" ] \
+      && printf "added→%s" "$newv" \
+      || printf "upgraded:%s→%s" "$oldv" "$newv" )
+    map_ga "$ga" "$status" "$FEATURE"
   done
   echo
 fi
 
-# 12) Map removed on BASE branch
+# 12) Map removed on base
 if [ "${#REMOVED[@]}" -gt 0 ]; then
-  echo "──── Mapping removed deps on '$BASE' ────"
-  git checkout -f "$BASE" &>/dev/null
+  echo "──── Mapping removed on '$BASE' ────"
   for ga in "${REMOVED[@]}"; do
     oldv=${base_versions[$ga]}
-    echo
-    echo "▶ $ga"
-    echo "    Status             : removed (→ $oldv)"
-    label=$(echo "$ga" | sed -E 's/[:\.-]/_/g')
-    bz="@${REPO}//:$label"
-    echo "    Bazel label        : $bz"
-
-    # Direct dependency
-    echo "    Direct dependency  :"
-    mapfile -t DIR_SRCS < <(
-      grep -R --include='BUILD*' -l "$bz" . \
-      | xargs -r -n1 dirname \
-      | sort -u
-    )
-    if [ "${#DIR_SRCS[@]}" -eq 0 ]; then
-      echo "      (none)"
-    else
-      for svc in "${DIR_SRCS[@]}"; do
-        echo "      - $svc"
-        record_services "$svc"
-      done
-    fi
-
-    # Transitive dependency (filter out INFO:)
-    echo "    Transitive dependency:"
-    mapfile -t TRANS_SRCS < <(
-      bazel query --noshow_loading_progress --noshow_progress \
-        "rdeps(//..., $bz)" \
-        --noimplicit_deps --notool_deps --output=package 2>&1 \
-      | grep -v '^INFO:' \
-      | sort -u
-    )
-    if [ "${#TRANS_SRCS[@]}" -eq 0 ]; then
-      echo "      (none)"
-    else
-      for svc in "${TRANS_SRCS[@]}"; do
-        echo "      - $svc"
-        record_services "$svc"
-      done
-    fi
+    map_ga "$ga" "removed→$oldv" "$BASE"
   done
   echo
 fi
 
-# 13) Final: list all affected services
+# 13) Final list of all affected services
 echo "── Affected services across all changes ──"
-mapfile -t ALL_SERVICES < <(printf "%s\n" "${!AFFECTED_SERVICES[@]}" | sort)
-if [ "${#ALL_SERVICES[@]}" -eq 0 ]; then
+mapfile -t SVC < <(printf "%s\n" "${!AFFECTED[@]}" | sort)
+if [ "${#SVC[@]}" -eq 0 ]; then
   echo "  (none)"
 else
-  for svc in "${ALL_SERVICES[@]}"; do
-    echo "  - $svc"
+  for s in "${SVC[@]}"; do
+    echo "  - $s"
   done
 fi
 echo
@@ -223,9 +185,6 @@ echo
 # 14) Restore & cleanup
 echo "🔙 Restoring branch '$CURR'"
 git checkout -f "$CURR" &>/dev/null
-if (( STASHED )); then
-  echo "🔓 Popping stash"
-  git stash pop &>/dev/null
-fi
+(( STASHED )) && git stash pop &>/dev/null
 rm -rf "$TMP"
-echo "✅ Done. Temporary files cleaned up."
+echo "✅ Done."
